@@ -1,0 +1,64 @@
+name: Native Dash browser verification
+on:
+  push:
+    branches: [codex/native-dash-20260908]
+    paths: ['native/**', '.github/workflows/native-dash-qa.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install isolated browser test tools
+        run: |
+          pip install playwright==1.52.0 pillow requests
+          python -m playwright install --with-deps chromium
+      - name: Capture public reference and current website
+        run: |
+          mkdir -p evidence/reference
+          python - <<'PY'
+          import json, pathlib, requests
+          from playwright.sync_api import sync_playwright
+          out=pathlib.Path('evidence/reference')
+          try:
+              r=requests.get('https://itunes.apple.com/lookup?id=625334537&country=us',timeout=45)
+              r.raise_for_status()
+              app=r.json()['results'][0]
+              urls=app.get('screenshotUrls',[]) or app.get('ipadScreenshotUrls',[])
+              (out/'source.json').write_text(json.dumps({'source':'https://apps.apple.com/us/app/geometry-dash/id625334537','trackName':app.get('trackName'),'version':app.get('version'),'screenshots':urls},indent=2))
+              for i,url in enumerate(urls[:5]):
+                  image=requests.get(url,timeout=45); image.raise_for_status()
+                  (out/f'apple-{i+1}.jpg').write_bytes(image.content)
+          except Exception as exc:
+              (out/'reference-error.txt').write_text(str(exc))
+          with sync_playwright() as p:
+              browser=p.chromium.launch()
+              page=browser.new_page(viewport={'width':1440,'height':1000},device_scale_factor=1)
+              try:
+                  page.goto('https://geometrylite.net',wait_until='domcontentloaded',timeout=60000)
+                  page.wait_for_timeout(3000)
+                  page.screenshot(path=str(out/'geometrylite-before.png'),full_page=False)
+              except Exception as exc:
+                  (out/'website-error.txt').write_text(str(exc))
+              browser.close()
+          PY
+      - name: Test native game locally and on public demo origin
+        env:
+          DEMO_URL: https://raw.githack.com/AndrewC776/Geometrylite/${{ github.sha }}/native/index.html
+        run: |
+          if test -f native/tests/browser_smoke.py; then
+            python native/tests/browser_smoke.py
+          else
+            echo 'Reference capture only; native implementation is being added.'
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-dash-evidence
+          path: evidence/
+          retention-days: 30

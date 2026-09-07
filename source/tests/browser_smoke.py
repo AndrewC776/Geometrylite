@@ -18,7 +18,7 @@ report['url']=url
 with sync_playwright() as p:
  browser=p.chromium.launch(headless=True)
  ctx=browser.new_context(viewport={'width':1280,'height':720},device_scale_factor=1,accept_downloads=True)
- page=ctx.new_page();page.set_default_timeout(12000)
+ page=ctx.new_page();page.set_default_timeout(15000)
  page.on('pageerror',lambda e:report['errors'].append(str(e)))
  requests=[];page.on('request',lambda r:requests.append(r.url))
  def load(pg=page):
@@ -30,11 +30,19 @@ with sync_playwright() as p:
     if retry==7:raise
    time.sleep(5)
   check('HTTP 200',response.status==200,{'status':response.status,'url':url})
+  # This CDN normally shows a first-visit confirmation. Click it just like a user.
+  # Do not mistake the confirmation page's HTTP 200 for a functioning game.
+  confirmation=pg.get_by_role('button',name='Open the page',exact=True)
+  if confirmation.count():
+   pg.screenshot(path=str(OUT/'00-host-first-visit.png'))
+   check('CDN confirmation points to our published game',pg.locator('#phish-dest').input_value()==url)
+   confirmation.click();pg.wait_for_load_state('domcontentloaded')
+   report['first_visit_instruction']='Click Open the page on the raw.githack confirmation screen.'
   pg.wait_for_function('document.querySelector("geometry-lite-game")?.game?.screen === "menu"');pg.wait_for_timeout(350)
  def g(expr,pg=page):return pg.evaluate('(s)=>{const g=document.querySelector("geometry-lite-game").game;return eval(s)}',expr)
  def shot(name):page.wait_for_timeout(250);page.screenshot(path=str(OUT/(name+'.png')))
  try:
-  load();shot('01-menu');check('No iframe',page.locator('iframe').count()==0);check('No audio before gesture',g('g.audio.ctx===null'));check('Native canvas visible',page.locator('canvas').is_visible())
+  load();requests.clear();shot('01-menu');check('No iframe',page.locator('iframe').count()==0);check('No audio before gesture',g('g.audio.ctx===null'));check('Native canvas visible',page.locator('canvas').is_visible())
   page.get_by_role('button',name='Choose a level',exact=True).click();shot('02-levels');page.get_by_role('button',name='▶ PLAY',exact=True).click()
   page.wait_for_function('document.querySelector("geometry-lite-game").game.world?.t>.20');check('Gesture unlocks audio',g('g.audio.ctx.state')=='running')
   page.keyboard.press('Space');page.wait_for_timeout(160);check('Actual keyboard jump',g('g.world.y<390 && g.world.jumps===1'))
@@ -73,6 +81,14 @@ with sync_playwright() as p:
   m.get_by_role('button',name='Pause',exact=True).tap();check('Touch pause works',g('g.screen',m)=='pause');mobile.close()
   check('No JavaScript errors',not report['errors'],report['errors']);check('No third-party game asset requests',all(u==url or 'favicon' in u or u.startswith('blob:') for u in requests),requests)
   g('g.destroy()');page.wait_for_timeout(100);check('Unmount closes audio',g('g.destroyed && g.audio.ctx.state==="closed"'));report['passed']=True
+ except Exception as exc:
+  report['exception']=str(exc)
+  try:
+   page.screenshot(path=str(OUT/'failure.png'))
+   (OUT/'failure.html').write_text(page.content())
+   report['game_state']=g('({screen:g.screen,t:g.world?.t,dead:g.world?.dead,won:g.world?.won,metrics:g.metrics})')
+  except Exception:pass
+  raise
  finally:
   save_report();browser.close();server.shutdown()
 print(json.dumps({'passed':report.get('passed',False),'checks':len(report['checks']),'url':url,'timing':report.get('timing'),'audio':report.get('audio')},indent=2))

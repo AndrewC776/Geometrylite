@@ -1,0 +1,110 @@
+name: Read-only Challenge Rush product comparison
+on:
+  push:
+    branches: [codex/native-dash-20260908]
+    paths: ['.github/workflows/challenge-rush-comparison.yml']
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install screenshot tooling
+        run: pip install playwright==1.52.0
+      - name: Capture ordinary anonymous gameplay and interface states
+        run: |
+          mkdir -p comparison
+          cat > /tmp/compare.py <<'PY'
+          import json,pathlib,re,time,hashlib
+          from playwright.sync_api import sync_playwright
+          out=pathlib.Path('comparison')
+          report={'purpose':'Read-only comparison; no production writes, no accounts, no invulnerability','views':[],'errors':[]}
+          def snapshot(page,label):
+              item={'label':label,'url':page.url,'frames':[]}
+              try:page.screenshot(path=str(out/(label+'.png')),timeout=15000)
+              except Exception as e:item['screenshot_error']=str(e)
+              for f in page.frames:
+                  try:
+                      item['frames'].append({'url':f.url,'text':f.locator('body').inner_text(timeout=2500)[:11000],
+                       'buttons':f.locator('button,[role=button]').evaluate_all('(els)=>els.filter(e=>e.getBoundingClientRect().width>0).map(e=>({text:e.innerText,label:e.getAttribute("aria-label"),id:e.id,cls:e.className,rect:{x:e.getBoundingClientRect().x,y:e.getBoundingClientRect().y,w:e.getBoundingClientRect().width,h:e.getBoundingClientRect().height}})).slice(0,90)'),
+                       'canvases':f.locator('canvas').evaluate_all('(els)=>els.map(e=>({id:e.id,width:e.width,height:e.height,rect:{x:e.getBoundingClientRect().x,y:e.getBoundingClientRect().y,w:e.getBoundingClientRect().width,h:e.getBoundingClientRect().height}}))')})
+                  except Exception as e:item['frames'].append({'url':f.url,'error':str(e)})
+              report['views'].append(item)
+              print(label,[(f.get('url'),len(f.get('text',''))) for f in item['frames']],flush=True)
+          def click_named(page,pattern):
+              for f in page.frames:
+                  try:
+                      loc=f.get_by_role('button',name=re.compile(pattern,re.I)).filter(visible=True)
+                  except Exception:
+                      loc=f.get_by_role('button',name=re.compile(pattern,re.I))
+                  try:
+                      for i in range(min(8,loc.count())):
+                          if loc.nth(i).is_visible():loc.nth(i).click(timeout=3000);return True
+                  except Exception:pass
+              return False
+          with sync_playwright() as p:
+              browser=p.chromium.launch(channel='chrome',headless=True)
+              context=browser.new_context(viewport={'width':1280,'height':720},device_scale_factor=1)
+              target=context.new_page();target.set_default_timeout(6000)
+              assets=[]
+              def record(response):
+                  try:
+                      h=response.headers;u=response.url
+                      if re.search(r'\.(mp3|ogg|m4a|wav|webm|png|webp|jpg|json)(\?|$)',u) or 'audio/' in h.get('content-type',''):
+                          assets.append({'url':u,'status':response.status,'type':h.get('content-type'),'bytes':h.get('content-length')})
+                  except Exception:pass
+              target.on('response',record)
+              target.on('pageerror',lambda e:report['errors'].append({'page':'target','error':str(e)}))
+              try:
+                  target.goto('https://1games.io/challenge-rush',wait_until='domcontentloaded',timeout=45000)
+                  target.wait_for_timeout(4000);snapshot(target,'target-00-site')
+                  target.goto('https://1games.io/embed/challenge-rush?preroll=0&pub_id=',wait_until='domcontentloaded',timeout=45000)
+                  target.wait_for_timeout(2500);snapshot(target,'target-01-embed-gate')
+                  clicked=click_named(target,r'^play(?:\s|$)')
+                  report['target_play_gate_clicked']=clicked
+                  target.wait_for_timeout(16000);snapshot(target,'target-02-loaded')
+                  # DOM actions only; inspect first, never inject gameplay state.
+                  for label,pat in [('target-03-level-menu',r'^(play|normal|levels|start)(\s|$)'),('target-04-first-level',r'^(play|start|normal mode)(\s|$)')]:
+                      if click_named(target,pat):target.wait_for_timeout(3500);snapshot(target,label)
+                  for i in range(4):
+                      target.keyboard.press('Space');target.wait_for_timeout(800)
+                  snapshot(target,'target-05-after-input')
+              except Exception as e:report['target_error']=str(e);snapshot(target,'target-failure')
+              (out/'target-assets.json').write_text(json.dumps(assets,indent=2))
+              ours=context.new_page();ours.set_default_timeout(12000)
+              try:
+                  res=ours.goto('https://geometrylite-net.vercel.app/native-dash/index.html',wait_until='domcontentloaded',timeout=45000)
+                  report['ours_html_sha256']=hashlib.sha256(res.body()).hexdigest()
+                  ours.wait_for_function('document.querySelector("geometry-lite-game")?.game?.screen==="menu"')
+                  snapshot(ours,'ours-01-menu')
+                  ours.get_by_role('button',name='Choose a level',exact=True).click();snapshot(ours,'ours-02-levels')
+                  ours.get_by_role('button',name=re.compile('Watch preview')).click()
+                  ours.wait_for_function('document.querySelector("geometry-lite-game").game.world.t>4.1');snapshot(ours,'ours-03-cube')
+                  ours.wait_for_function('document.querySelector("geometry-lite-game").game.world.t>17.4',timeout=25000);snapshot(ours,'ours-04-ship')
+                  ours.keyboard.press('Escape')
+              except Exception as e:report['ours_error']=str(e);snapshot(ours,'ours-failure')
+              # Compare portrait first-screen states in separate fresh mobile contexts.
+              for name,url in [('ours','https://geometrylite-net.vercel.app/native-dash/index.html'),('target','https://1games.io/embed/challenge-rush?preroll=0&pub_id=')]:
+                  ctx=browser.new_context(viewport={'width':390,'height':844},device_scale_factor=1,is_mobile=True,has_touch=True)
+                  m=ctx.new_page();m.set_default_timeout(6000)
+                  try:
+                      m.goto(url,wait_until='domcontentloaded',timeout=45000);m.wait_for_timeout(2000)
+                      if name=='target':click_named(m,r'^play(?:\s|$)');m.wait_for_timeout(14000)
+                      snapshot(m,name+'-mobile-menu')
+                      m.set_viewport_size({'width':844,'height':390});m.wait_for_timeout(800);snapshot(m,name+'-mobile-landscape')
+                  except Exception as e:report[name+'_mobile_error']=str(e)
+                  ctx.close()
+              browser.close()
+          (out/'report.json').write_text(json.dumps(report,indent=2))
+          PY
+          python /tmp/compare.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: challenge-rush-comparison
+          path: comparison/
+          retention-days: 14

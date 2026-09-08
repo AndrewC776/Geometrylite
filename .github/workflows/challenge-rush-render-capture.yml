@@ -1,0 +1,67 @@
+name: Challenge Rush actual gameplay capture
+on:
+  push:
+    branches: [codex/native-dash-20260908]
+    paths: ['.github/workflows/challenge-rush-render-capture.yml']
+permissions:
+  contents: read
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install playwright==1.52.0 pillow
+      - name: Ordinary public game in software-WebGL browser
+        run: |
+          mkdir -p capture
+          cat > /tmp/capture.py <<'PY'
+          import json,pathlib,time,re
+          from playwright.sync_api import sync_playwright
+          from PIL import Image
+          out=pathlib.Path('capture');report={'source':'https://1games.io/challenge-rush','actual_frame_source':'https://challengerush.com/','console':[],'requests':[],'failed':[],'states':[]}
+          with sync_playwright() as p:
+              b=p.chromium.launch(channel='chrome',headless=False,args=['--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader'])
+              ctx=b.new_context(viewport={'width':1280,'height':720},device_scale_factor=1)
+              page=ctx.new_page();page.set_default_timeout(10000)
+              page.on('console',lambda e:report['console'].append({'type':e.type,'text':e.text[:2500]}) if len(report['console'])<150 else None)
+              page.on('requestfailed',lambda r:report['failed'].append({'url':r.url.split('?')[0],'failure':r.failure}))
+              def resp(r):
+                  try:
+                      if 'challengerush' in r.url or any(x in r.url for x in ['.wasm','.data','.mp3','.ogg','.m4a']):
+                          report['requests'].append({'url':r.url.split('?')[0],'status':r.status,'type':r.headers.get('content-type'),'bytes':r.headers.get('content-length')})
+                  except Exception:pass
+              page.on('response',resp)
+              def snap(label):
+                  page.screenshot(path=str(out/(label+'.png')))
+                  c=page.locator('#unity-canvas')
+                  rect=c.bounding_box() if c.count() else None
+                  if rect and rect['width']>0:c.screenshot(path=str(out/(label+'-canvas.png')))
+                  state={'label':label,'url':page.url,'canvas':rect,'body':page.locator('body').inner_text()[:1200]}
+                  report['states'].append(state);print(state,flush=True)
+              try:
+                  page.goto('https://challengerush.com/',wait_until='domcontentloaded',timeout=45000)
+                  page.locator('#playBtn').click();page.wait_for_timeout(15000);snap('01-after-15s')
+                  page.wait_for_timeout(15000);snap('02-after-30s')
+                  page.wait_for_timeout(20000);snap('03-menu')
+                  # Real canvas pointer inputs only. Capture every state for human inspection.
+                  for i,(rx,ry) in enumerate([(0.5,.53),(.5,.60),(.5,.5)]):
+                      c=page.locator('#unity-canvas');r=c.bounding_box()
+                      if not r:break
+                      page.mouse.click(r['x']+r['width']*rx,r['y']+r['height']*ry)
+                      page.wait_for_timeout(2200);snap(f'04-click-{i}')
+                  for i in range(6):
+                      page.keyboard.press('Space');page.wait_for_timeout(600);snap(f'05-input-{i}')
+              except Exception as e:report['exception']=str(e)
+              finally:b.close()
+          (out/'report.json').write_text(json.dumps(report,indent=2))
+          PY
+          xvfb-run -a python /tmp/capture.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: challenge-rush-render-capture
+          path: capture/
+          retention-days: 14

@@ -1,0 +1,87 @@
+name: Check public native production origins
+on:
+  push:
+    branches: [codex/native-dash-20260908]
+    paths: ['.github/workflows/production-mobile-origin-check.yml']
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install actual browser engines
+        run: |
+          pip install playwright==1.52.0
+          python -m playwright install --with-deps chromium webkit
+      - name: Probe normal anonymous navigation, not a logged-in preview
+        run: |
+          mkdir -p production-origin-evidence
+          python - <<'PY'
+          import hashlib,json,pathlib,time
+          from playwright.sync_api import sync_playwright
+          out=pathlib.Path('production-origin-evidence')
+          expected='4d27ab7eaa9b7ca95bead857dcfa911af56b5d7f1ebdb8b6076b301d15e9b115'
+          urls=['https://geometrylite.net/native-dash/index.html','https://geometrylite-net.vercel.app/native-dash/index.html','https://geometrylite-net-spotito.vercel.app/native-dash/index.html']
+          report={'expected_sha256':expected,'checks':[],'verified_url':None,'scope':'Anonymous standard Chromium/WebKit mobile contexts; no auth bypass or anti-bot modifications'}
+          try:
+              with sync_playwright() as p:
+                  browser=p.chromium.launch()
+                  ctx=browser.new_context(viewport={'width':390,'height':844},is_mobile=True,has_touch=True)
+                  page=ctx.new_page()
+                  for attempt in range(12):
+                      for i,url in enumerate(urls):
+                          item={'url':url,'attempt':attempt}
+                          try:
+                              response=page.goto(url,wait_until='domcontentloaded',timeout=20000)
+                              digest=hashlib.sha256(response.body()).hexdigest()
+                              item.update({'status':response.status,'final_url':page.url,'sha256':digest})
+                              page.screenshot(path=str(out/f'origin-{i}.png'))
+                              if response.status==200 and digest==expected:
+                                  page.wait_for_function('document.querySelector("geometry-lite-game")?.game?.screen==="menu"',timeout=12000)
+                                  item['native_version']=page.evaluate('GeometryLiteNative.version')
+                                  if item['native_version']=='1.1.0':report['verified_url']=url
+                          except Exception as e:item['error']=str(e)
+                          report['checks'].append(item)
+                          if report['verified_url']:break
+                      if report['verified_url']:break
+                      time.sleep(5)
+                  browser.close()
+                  if not report['verified_url']:raise RuntimeError('None of the public origins served the released native game')
+                  report['mobile_engines']=[]
+                  for engine in ['chromium','webkit']:
+                      b=getattr(p,engine).launch()
+                      c=b.new_context(viewport={'width':390,'height':844},is_mobile=True,has_touch=True)
+                      q=c.new_page();errors=[];q.on('pageerror',lambda e:errors.append(str(e)))
+                      r=q.goto(report['verified_url'],wait_until='domcontentloaded',timeout=30000)
+                      q.wait_for_function('document.querySelector("geometry-lite-game")?.game?.screen==="menu"')
+                      assert r.status==200 and hashlib.sha256(r.body()).hexdigest()==expected
+                      assert q.locator('iframe').count()==0
+                      q.screenshot(path=str(out/f'{engine}-public-menu.png'))
+                      q.get_by_role('button',name='Choose a level',exact=True).tap()
+                      q.get_by_role('button',name='▶ PLAY',exact=True).tap()
+                      q.wait_for_function('document.querySelector("geometry-lite-game").game.world.t>.2')
+                      assert q.evaluate('document.querySelector("geometry-lite-game").game.audio.ctx.state==="running"')
+                      q.get_by_role('button',name='Jump or hold to fly',exact=True).tap()
+                      q.wait_for_timeout(100)
+                      assert q.evaluate('document.querySelector("geometry-lite-game").game.world.jumps===1')
+                      q.screenshot(path=str(out/f'{engine}-public-playing.png'))
+                      q.get_by_role('button',name='Pause',exact=True).tap()
+                      assert q.evaluate('document.querySelector("geometry-lite-game").game.screen==="pause"')
+                      assert not errors
+                      report['mobile_engines'].append({'engine':engine,'passed':True,'http':r.status,'revision':'1.1.0','checks':['exact production bytes','no iframe','anonymous access','real tap start','audio running','real portrait jump','pause','no JavaScript errors'],'errors':errors})
+                      b.close()
+                  report['passed']=True
+          finally:
+              (out/'report.json').write_text(json.dumps(report,indent=2))
+              print(json.dumps(report,indent=2),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-production-origin-browser-evidence
+          path: production-origin-evidence/
+          retention-days: 30
